@@ -1,273 +1,407 @@
-import { FastifyRequest, FastifyReply } from "fastify";
-import Bull, { Queue, Job } from "bull";
-import { EcommerceCrawler } from "../services/crawlee.service.js";
-import type { CrawlerConfig } from "../services/crawlee.service.js";
+// docker run -d --name redis -p 6379:6379 redis
+/**
+ * Imports from Crawlee and Node.js URL module
+ */
+import { enqueueLinks, Configuration, PlaywrightCrawler, ProxyConfiguration } from 'crawlee';
+import { createPlaywrightRouter, Dataset } from 'crawlee';
+import { URL } from 'url';
+import { RequestQueue } from 'crawlee';
+// ES6+ example
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import 'dotenv/config';
 
-// Enum for job states for better type safety
-enum JobStatus {
-  PENDING = "pending",
-  ACTIVE = "active",
-  COMPLETED = "completed",
-  FAILED = "failed",
-  DELAYED = "delayed",
+/**
+ * Types for the configuration of the EcommerceCrawler
+ */
+export interface CrawlerConfig {
+  /** Array of initial URLs to start the crawl from */
+  startUrls: string[];
+  // /** Array of regex patterns to identify listing pages */
+  productListingUrlPatterns: string[];
+  // /** Array of regex patterns to identify product cards */
+  productCardSelectors: string;
+  /** Array of regex patterns to identify product pages */
+  productUrlPatterns: string[];
+  /** CSS selectors for pagination links */
+  paginationSelectors: string;
+  /** CSS selectors for product links */
+  productLinkSelectors: string[];
+  /** Optional maximum number of pages to process */
+  maxPages?: number;
+  nameSelector: string;
+  priceSelector: string;
 }
 
-// Interface for job result
-interface CrawlJobResult {
-  crawlId: string;
-  processedItems: number;
-  metadata?: Record<string, any>;
-}
+/**
+ * Helper function to check if a given URL matches any product URL pattern
+ * @param {string} url - The URL to check
+ * @param {string[]} patterns - Array of regex patterns
+ * @returns {boolean} - True if the URL matches any pattern
+ */
+const isProductUrl = (url: string, patterns: string[]): boolean => {
+  return patterns.some((pattern) => {
+    const regex = createRegexFromUrl(pattern);
+    return regex.test(url);
+  });
+};
+const createRegexFromUrl = (url: string) => {
+  // Parse the URL
+  const urlParts = new URL(url);
 
-// Enhanced error handling class
-class CrawlJobError extends Error {
-  constructor(
-    public message: string,
-    public code: string,
-    public details?: Record<string, any>
-  ) {
-    super(message);
-    this.name = "CrawlJobError";
+  // Create a regex that matches the domain
+  return new RegExp(`^https?://[\\w-]+\\.${urlParts.hostname.split('.').slice(1).join('\\.')}`, 'i');
+};
+
+const isListingUrl = (url: string, patterns: string[]): boolean => {
+  return patterns.some((pattern) => {
+    const regex = createRegexFromUrl(pattern);
+    return regex.test(url);
+  });
+  //const regex = createRegexFromUrl(patterns);
+  // return regex.test(url);
+};
+
+/**
+ * Helper function to extract the domain name from a URL
+ * @param {string} url - The URL to parse
+ * @returns {string} - The domain name
+ */
+const getDomain = (url: string): string => {
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.hostname;
+  } catch (error) {
+    return '';
   }
-}
+};
 
-class CrawleeController {
-  private queue: Queue;
-  private static MAX_CONCURRENT_JOBS = 5;
-  private static JOB_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
+/**
+ * Helper function to normalize URLs relative to a base URL
+ * @param {string} url - The URL to normalize
+ * @param {string} baseUrl - The base URL
+ * @returns {string} - The normalized absolute URL
+ */
+const normalizeUrl = (url: string, baseUrl: string): string => {
+  try {
+    return new URL(url, baseUrl).href;
+  } catch (error) {
+    return '';
+  }
+};
 
-  constructor() {
-    this.queue = new Bull("crawlee-queue", {
-      redis: {
-        host: process.env.REDIS_HOST || "host.docker.internal",
-        port: process.env.REDIS_PORT || "6379",
-      },
-      settings: {
-        maxStalledCount: 3,
-        stalledInterval: 30000, // 30 seconds
-      },
-      // Limit concurrent job processing
-      limiter: {
-        max: CrawleeController.MAX_CONCURRENT_JOBS,
-        duration: 5000, // 5 seconds window
-      },
-    });
+/**
+ * A class to manage e-commerce web scraping using Crawlee
+ */
+export class EcommerceCrawler {
+  /** Configuration object for the crawler */
+  private config: CrawlerConfig;
+  /** Set to track processed URLs */
+  private processedUrls: Set<string> = new Set();
+  /** Counter to track the number of pages processed */
+  private pageCount: number = 0;
 
-    this.setupQueueProcessing();
-    this.setupErrorHandling();
+  /**
+   * Constructor to initialize the crawler
+   * @param {CrawlerConfig} config - Configuration object
+   */
+  constructor(config: CrawlerConfig) {
+    this.config = {
+      maxPages: 1000, // Default maximum pages
+      ...config,
+    };
   }
 
-  private setupQueueProcessing() {
-    this.queue.process(async (job: Job) => {
-      // Set a timeout for long-running jobs
-      job.opts.timeout = CrawleeController.JOB_TIMEOUT;
+  /**
+   * Main function to run the crawler
+   */
+  async run() {
+    const router = createPlaywrightRouter();
+    const requestQueue = await RequestQueue.open();
 
-      console.log(`Processing job ${job.id} started`);
+    /**
+     * Default route handler for category or listing pages
+     */
+    router.addDefaultHandler(async ({ request, enqueueLinks, log }) => {
+      const baseUrl = request.loadedUrl;
+      if (!baseUrl) return;
 
-      try {
-        // Validate job data
-        const crawleeConfig: CrawlerConfig = job.data.config;
-        if (!crawleeConfig) {
-          throw new CrawlJobError(
-            "Invalid crawler configuration",
-            "INVALID_CONFIG",
-            { jobData: job.data }
-          );
-        }
-
-        // Create and run the crawler
-        const crawler = new EcommerceCrawler(crawleeConfig);
-
-        // Optional: Capture dataset
-        const dataset = await crawler.run();
-
-        // Generate a unique ID for this crawl
-        const crawlId = await crawler.crawleeId();
-
-        // Process dataset (example)
-        const datasetItems = await dataset.getData();
-
-        const result: CrawlJobResult = {
-          crawlId,
-          processedItems: datasetItems.length,
-          metadata: {
-            startedAt: job.timestamp,
-            completedAt: Date.now(),
-            config: crawleeConfig,
-          },
-        };
-
-        console.log(`Job ${job.id} completed successfully`);
-        return result;
-      } catch (error) {
-        // Enhanced error logging
-        console.error(`Job ${job.id} processing error:`, error);
-
-        // Throw a structured error for better tracking
-        throw new CrawlJobError(
-          error instanceof Error ? error.message : "Unknown crawl error",
-          "CRAWL_FAILED",
-          {
-            originalError: error,
-            jobId: job.id,
+      await enqueueLinks({
+        limit: 100,
+        transformRequestFunction: (req) => {
+          const url = normalizeUrl(req.url, baseUrl);
+          if (!this.processedUrls.has(url) && isListingUrl(url, this.config.productListingUrlPatterns)) {
+            this.processedUrls.add(url);
+            return req;
           }
-        );
-      }
-    });
-  }
-
-  private setupErrorHandling() {
-    // Comprehensive event listeners for job lifecycle
-    this.queue.on("completed", (job, result) => {
-      console.log(`Job ${job.id} completed`, {
-        result,
-        duration: Date.now() - job.timestamp,
-      });
-    });
-
-    this.queue.on("failed", (job, error) => {
-      console.error(`Job ${job.id} failed`, {
-        error: error.message,
-        stack: error.stack,
-      });
-    });
-
-    this.queue.on("stalled", (job) => {
-      console.warn(`Job ${job.id} stalled`, {
-        attempts: job.attemptsMade,
-      });
-    });
-  }
-
-  public createCrawlee = async (req: FastifyRequest, reply: FastifyReply) => {
-    try {
-      // Type and validation for crawler configuration
-      const crawleeConfig: CrawlerConfig = req.body as CrawlerConfig;
-
-      // Validate configuration
-      this.validateCrawlerConfig(crawleeConfig);
-
-      // Add job to queue with robust options
-      const job = await this.queue.add(
-        { config: crawleeConfig },
-        {
-          // Enhanced job resilience
-          attempts: 3,
-          backoff: {
-            type: "exponential",
-            delay: 1000, // Initial delay of 1 second
-          },
-          removeOnComplete: 100, // Keep last 100 completed jobs
-          removeOnFail: 200, // Keep last 200 failed jobs
-        }
-      );
-
-      // Respond with detailed job information
-      return {
-        job_id: job.id,
-        status: await job.getState(),
-        message: "Crawlee job queued successfully",
-        queuePosition: await this.queue.getJobCounts(),
-      };
-    } catch (error) {
-      console.error("Error in createCrawlee:", error);
-
-      // Differentiate between validation and processing errors
-      if (error instanceof CrawlJobError) {
-        return reply.status(400).send({
-          error: error.code,
-          message: error.message,
-          details: error.details,
-        });
-      }
-
-      return reply.status(500).send({
-        error: "INTERNAL_ERROR",
-        message: "Failed to create crawl job",
-      });
-    }
-  };
-
-  public getJobStatus = async (req: FastifyRequest, reply: FastifyReply) => {
-    try {
-      const { jobId } = req.params as { jobId: string };
-      const job = await this.queue.getJob(jobId);
-
-      if (!job) {
-        return reply.status(404).send({ error: "Job not found" });
-      }
-
-      const state = await job.getState();
-      const result = await job.returnvalue;
-
-      return {
-        job_id: job.id,
-        state,
-        result,
-        progress: job.progress(), // Track job progress
-        attempts: {
-          total: job.attemptsMade,
-          max: job.opts.attempts,
+          return false;
         },
-      };
-    } catch (error) {
-      console.error("Error in getJobStatus:", error);
-      return reply.status(500).send({
-        error: "INTERNAL_ERROR",
-        message: "Failed to retrieve job status",
+        label: 'listing',
       });
-    }
-  };
+    });
 
-  // Additional method to validate crawler configuration
-  private validateCrawlerConfig(config: CrawlerConfig) {
-    if (!config) {
-      throw new CrawlJobError(
-        "Crawler configuration is required",
-        "MISSING_CONFIG"
-      );
-    }
+    router.addHandler('listing', async ({ request, page, log, enqueueLinks }) => {
+      try {
+        log.info(`Processing URL: ${request.loadedUrl}`);
 
-    // Add specific validation rules
-    if (!config.urls || config.urls.length === 0) {
-      throw new CrawlJobError(
-        "At least one URL must be provided",
-        "INVALID_URLS"
-      );
-    }
+        // // Existing product extraction logic...
+        const productCardSelector = this.config.productCardSelectors;
 
-    // Add more specific validation as needed
+        // Wait for product card selector to be available
+        await page.waitForSelector(productCardSelector, { state: 'attached', timeout: 10000 });
+
+        // Extract product details
+        const products = await page.evaluate((selector) => {
+          const productCards = document.querySelectorAll(selector);
+          return Array.from(productCards)
+            .map((card) => {
+              const linkElement = card.querySelector('a[href]');
+              return linkElement ? linkElement.getAttribute('href') : null;
+            })
+            .filter((href): href is string => href !== null);
+        }, productCardSelector);
+
+        Enqueue the product URLs
+        if (products.length > 0) {
+          await enqueueLinks({
+            limit: 1,
+            urls: products,
+            label: 'product',
+            requestQueue,
+          });
+
+          log.info(`Extracted ${products.length} product URLs`);
+        }
+
+        // Pagination logic
+        const paginationSelector = this.config.paginationSelectors;
+        const nextButton = await page.locator(paginationSelector);
+
+        // TODO - check if the next button is blocked
+        // const isClickBlocked = async (element) => {
+        //   const boundingBox = await element.boundingBox();
+        //   if (!boundingBox) {
+        //     return true; // If no bounding box, the element is not visible or disabled
+        //   }
+
+        //   const isOverlaid = await page.evaluate((boundingBox) => {
+        //     const elements = document.elementsFromPoint(
+        //       boundingBox.x + boundingBox.width / 2,
+        //       boundingBox.y + boundingBox.height / 2,
+        //     );
+        //     return elements.some((elem) => elem !== document.documentElement && elem !== boundingBox);
+        //   }, boundingBox);
+
+        //   return isOverlaid; // Return true if overlaid, false if not
+        // };
+        // let is_blocked = await isClickBlocked(nextButton);
+        // if (is_blocked) {
+        //        await clickAcceptButton();
+        //   is_blocked = await isClickBlocked(nextButton);
+        // }
+
+        const clickAcceptButton = async () => {
+          const acceptButton = page.locator('#AcceptAll'); // Adjust this selector based on your page
+          await page.waitForLoadState('networkidle'); // Waits for no network connections for at least 500 ms
+          await page.evaluate(() => {
+            const overlay = document.getElementById('cbOvlry');
+            if (overlay) {
+              overlay.remove(); // Remove the overlay element from the DOM
+            }
+          });
+
+          // Wait for the element to be visible and stable
+          await acceptButton.waitFor({ state: 'attached' }); // Ensures the element is in the DOM
+          await acceptButton.waitFor({ state: 'visible' }); // Ensures the element is visible
+          if (!acceptButton) return;
+          // Optional: Ensure the element is not moving or animating
+          //   await acceptButton.waitFor({ state: 'stable' });
+
+          // Scroll into view if necessary and click the button
+          await acceptButton.scrollIntoViewIfNeeded();
+
+          await acceptButton.first().click();
+        };
+        await clickAcceptButton();
+        // Check if next button exists
+        if ((await nextButton.count()) > 0) {
+          try {
+            await nextButton.first().click();
+
+            // Wait for the page to load
+            await page.waitForSelector(productCardSelector, {
+              state: 'attached',
+              timeout: 10000,
+            });
+
+            log.info(`Navigated to next page`);
+
+            // Add the current page back to the queue with high priority
+            await requestQueue.addRequest({
+              url: page.url(),
+              label: 'listing',
+              uniqueKey: page.url(),
+              priority: 1,
+            });
+          } catch (paginationError) {
+            log.error(`Pagination error: ${paginationError.message}`);
+          }
+        } else {
+          log.info('No more pages to process');
+        }
+      } catch (error) {
+        log.error(`Error while processing URL ${request.loadedUrl}: ${error.message}`);
+      }
+    });
+
+    // Optional: Product page handler
+    router.addHandler('product', async ({ request, page, log }) => {
+      try {
+        log.info(`Processing product URL: ${request.loadedUrl}`);
+
+        // Create S3 client with configuration
+        // const s3Client = new S3Client({
+        //   region: process.env.AWS_REGION || 'us-east-1', // Specify your AWS region
+        //   credentials: {
+        //     accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+        //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+        //   },
+        // });
+
+        // Get the page HTML content
+        const product_html = await page.content();
+
+        //  let name = await page.locator('//*[@id="__layout"]/div/main/div/div[3]/div[1]/div/div[1]/h1');
+
+        // Dynamically fetch the name and price using config selectors
+        const nameSelector = this.config.nameSelector;
+        const priceSelector = this.config.priceSelector;
+
+        // Extract product name using the config selector
+        let name = await page.locator(nameSelector);
+        const productName = await name.textContent();
+        console.log('Product Name:', productName);
+
+        // Extract price using the config selector
+        const priceElement = await page.locator(priceSelector).first();
+        const price = await priceElement.textContent();
+        console.log('Price:', price);
+        const eanLabelLocator = await page.locator('body').locator('text=EAN');
+
+        // Check if the "EAN" text exists
+        if ((await eanLabelLocator.count()) > 0) {
+          // Find the parent element (tr or other container) and extract the associated number
+          const eanValueLocator = await eanLabelLocator.locator('xpath=following-sibling::td | ancestor::tr//td');
+
+          // Get the EAN number associated with it
+          const eanValue = await eanValueLocator.textContent();
+          console.log('EAN Value:', eanValue?.trim());
+        } else {
+          throw new Error('EAN label not found on the page');
+        }
+
+        // let eanSelector = this.config.eanSelector;
+
+        // Generate a unique filename
+        const filename = `products/${new Date().toISOString()}_${generateUniqueId()}.html`;
+
+        // if (!request.loadedUrl)
+        // // Prepare S3 upload parameters
+        // const params = {
+        //   Bucket: process.env.S3_BUCKET_NAME!, // Your S3 bucket name from environment variable
+        //   Key: filename,
+        //   Body: product_html,
+        //   ContentType: 'text/html',
+        // };
+
+        try {
+          // Upload HTML to S3
+          //      const command = new PutObjectCommand(params);
+          // const response = await s3Client.send(command);
+
+          log.info(`Product HTML uploaded to S3: ${filename}`);
+
+          // Optionally, you can save metadata about the upload
+          // await Dataset.pushData({
+          //   url: request.loadedUrl,
+          //   s3Path: filename,
+          //   uploadTimestamp: new Date().toISOString()
+          // });
+        } catch (s3Error) {
+          log.error(`S3 Upload Error for ${request.loadedUrl}: ${s3Error.message}`);
+        }
+      } catch (error) {
+        log.error(`Error processing product ${request.loadedUrl}: ${error.message}`);
+      }
+    });
+
+    // Utility function to generate a unique ID
+    function generateUniqueId() {
+      return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    }
+    
+// TODO process.env 
+
+    const config = Configuration.getGlobalConfig();
+    config.set('persistStateIntervalMillis', 10_000);
+    config.set('purgeOnStart', true);
+    // config.set('',);
+
+    // Create and configure the PlaywrightCrawler
+    const crawler = new PlaywrightCrawler({
+      // headless: false,
+      requestHandler: router,
+      maxRequestsPerCrawl: this.config.maxPages! * 2, // Account for product & category pages
+      maxConcurrency: 10,
+    });
+
+    // Start the crawl
+    await crawler.run(this.config.startUrls);
+
+    // Open the dataset for further processing
+    return Dataset.open();
   }
 
-  // Optional: Method to list recent jobs
-  public listRecentJobs = async (req: FastifyRequest, reply: FastifyReply) => {
-    try {
-      const { limit = 10 } = req.query as { limit?: number };
-
-      // Get recent completed and failed jobs
-      const completedJobs = await this.queue.getCompleted(0, limit);
-      const failedJobs = await this.queue.getFailed(0, limit);
-
-      return {
-        completed: completedJobs.map((job) => ({
-          id: job.id,
-          timestamp: job.timestamp,
-          result: job.returnvalue,
-        })),
-        failed: failedJobs.map((job) => ({
-          id: job.id,
-          timestamp: job.timestamp,
-          error: job.failedReason,
-        })),
-      };
-    } catch (error) {
-      console.error("Error listing jobs:", error);
-      return reply.status(500).send({
-        error: "JOBS_LIST_ERROR",
-        message: "Failed to retrieve job list",
-      });
-    }
-  };
+  // Utility method to generate a unique crawler ID
+  async crawleeId(id?: number) {
+    if (id) return id;
+    return new Date().getTime();
+  }
 }
 
-export default CrawleeController;
+// {
+//   "startUrls": ["https://www.bouwmaat.nl/"],
+//   "productListingUrlPatterns": [
+//     "https://www.bouwmaat.nl/bouwmaterialen/droge-afbouw/metalen-profielen"
+//   ],
+//   "productUrlPatterns": ["/buy/", "/p/", "/item/", "products?id="],
+//   "productCardSelectors": ".group.relative.rounded.shadow.px-3.py-6.bg-white.flex.flex-col.text-sm.hover\\:shadow-lg.md\\:px-6",
+//   "productLinkSelectors": [
+//     "a[href*=\"/product/\"]",
+//     "a[href*=\"/p/\"]",
+//     ".product-card a",
+//     ".product-link"
+//   ],
+//   "paginationSelectors": "//*[@id='product-lister-result']/div[4]/div/ul/li[8]/button",
+//   "nameSelector": "//*[@id='__layout']/div/main/div/div[3]/div[1]/div/div[1]/h1",
+//   "priceSelector": "//*[@id='__layout']/div/main/div/div[3]/div[1]/div/div[3]/div[2]/div[1]/div/div/p/span[1]/span",
+//   "maxPages": 100
+// }
+
+// {
+//   "startUrls": ["https://www.elektramat.nl"],
+//   "productListingUrlPatterns": [
+//     "https://www.elektramat.nl/installatiemateriaal/aardingsmateriaal/badkameraardingsrail/"
+//   ],
+//   "productUrlPatterns": ["/buy/", "/p/", "/item/", "products?id="],
+//   "productCardSelectors": ".product-item",
+//   "productLinkSelectors": [
+//     "a[href*=\"/product/\"]",
+//     "a[href*=\"/p/\"]",
+//     ".product-card a",
+//     ".product-link"
+//   ],
+//   "paginationSelectors": "//*[@id='maincontent']/div[4]/div[2]/section/div[3]/div/nav/ol/a",
+//   "nameSelector": "//*[@id='maincontent']/div[3]/div/div[1]/div[2]/section/div[2]/div/strong",
+//   "priceSelector": "//*[@id='product-main-price']/div/div[1]/div[1]/span/span[1]",
+//   "maxPages": 100
+// }
